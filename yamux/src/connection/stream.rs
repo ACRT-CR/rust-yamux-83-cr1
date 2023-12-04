@@ -10,6 +10,7 @@
 
 use crate::connection::rtt::Rtt;
 use crate::frame::header::ACK;
+use crate::ConnectionError;
 use crate::{
     chunks::Chunks,
     connection::{self, rtt, StreamCommand},
@@ -119,7 +120,7 @@ impl Stream {
         id: StreamId,
         conn: connection::Id,
         config: Arc<Config>,
-        current_send_window_size: u32,
+        send_window: u32,
         sender: mpsc::Sender<StreamCommand>,
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
@@ -132,7 +133,7 @@ impl Stream {
             flag: Flag::Ack,
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
-                current_send_window_size,
+                send_window,
                 accumulated_max_stream_windows,
                 rtt,
                 config,
@@ -367,21 +368,17 @@ impl AsyncWrite for Stream {
                 log::debug!("{}/{}: can no longer write", self.conn, self.id);
                 return Poll::Ready(Err(self.write_zero_err()));
             }
-            if shared.current_send_window_size() == 0 {
+            if shared.send_window() == 0 {
                 log::trace!("{}/{}: no more credit left", self.conn, self.id);
                 shared.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            let k = std::cmp::min(
-                shared.current_send_window_size(),
-                buf.len().try_into().unwrap_or(u32::MAX),
-            );
-            let k = std::cmp::min(
-                k,
-                self.config.split_send_size.try_into().unwrap_or(u32::MAX),
-            );
-            shared.consume_send_window(k);
-            Vec::from(&buf[..k as usize])
+            let k = std::cmp::min(shared.send_window() as usize, buf.len());
+            let k = std::cmp::min(k, self.config.split_send_size);
+            shared
+                .consume_send_window(k as u32)
+                .expect("not exceed receive window");
+            Vec::from(&buf[..k])
         };
         let n = body.len();
         let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
@@ -446,8 +443,8 @@ pub(crate) struct Shared {
 
 impl Shared {
     fn new(
-        current_receive_window_size: u32,
-        current_send_window_size: u32,
+        receive_window: u32,
+        send_window: u32,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
         rtt: Rtt,
         config: Arc<Config>,
@@ -457,8 +454,8 @@ impl Shared {
                 acknowledged: false,
             },
             flow_controller: FlowController::new(
-                current_receive_window_size,
-                current_send_window_size,
+                receive_window,
+                send_window,
                 accumulated_max_stream_windows,
                 rtt,
                 config,
@@ -523,23 +520,19 @@ impl Shared {
         )
     }
 
-    pub(crate) fn current_send_window_size(&self) -> u32 {
-        self.flow_controller.current_send_window_size()
+    pub(crate) fn send_window(&self) -> u32 {
+        self.flow_controller.send_window()
     }
 
-    pub(crate) fn consume_send_window(&mut self, i: u32) {
+    pub(crate) fn consume_send_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.flow_controller.consume_send_window(i)
     }
 
-    pub(crate) fn increase_send_window_by(&mut self, i: u32) {
+    pub(crate) fn increase_send_window_by(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.flow_controller.increase_send_window_by(i)
     }
 
-    pub(crate) fn current_receive_window_size(&self) -> u32 {
-        self.flow_controller.current_receive_window_size()
-    }
-
-    pub(crate) fn consume_receive_window(&mut self, i: u32) {
+    pub(crate) fn consume_receive_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.flow_controller.consume_receive_window(i)
     }
 }
